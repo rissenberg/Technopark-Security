@@ -1,8 +1,9 @@
 const http = require('http');
 const net = require('net');
 const fs = require('fs');
-const Url = require('url');
-// const mongodb = require('mongodb').MongoClient;
+const url = require('url');
+const Url = require("url");
+const {MongoClient} = require('mongodb')
 
 const PORT = 8080;
 
@@ -14,7 +15,40 @@ const tlsOptions = {
     rejectUnauthorized: false
 };
 
-const reqParser = (req) => {
+// Подключение к БД
+const mongoURL = 'mongodb://rissenberg:password@127.0.0.1:27017/?authMechanism=DEFAULT';
+const dbName = 'proxy_cache';
+
+const MongoDBClient = new MongoClient(mongoURL)
+const connectMDB = async () =>{
+    try {
+        await MongoDBClient.connect()
+        console.log("Успешно подключились к MongoDB")
+    } catch (e) {
+        console.log(e)
+    }
+}
+
+connectMDB();
+
+const saveRequestResponse = async (reqResObj) => {
+    try {
+        // await MongoDBClient.connect()
+        // console.log("Успешно подключились к базе данных")
+
+        const reqRes = MongoDBClient.db(dbName).collection('requests_responses')
+        await reqRes.insertOne(reqResObj)
+
+        console.log("Успешно записано в БД")
+    } catch (e) {
+        console.log(e)
+        await MongoDBClient.close();
+        connectMDB();
+    }
+};
+
+
+const reqResParser = (req, res) => {
     // Парсим Request
     const parsedUrl = Url.parse(req.url, true);
     const method = req.method;
@@ -51,85 +85,84 @@ const reqParser = (req) => {
         queryParams,
         headers,
         cookies,
-        body,
         postParams
     };
 
-    return requestData;
+    // Парсим Response
+    const statusRes = res.statusCode;
+    const headersRes = res.headers;
+    const message = res.statusMessage;
+    let bodyRes = '';
+    res.on('data', chunk => {
+        bodyRes += chunk;
+    });
+
+    const responseData = {
+        status: statusRes,
+        message,
+        headers: headersRes,
+        body: bodyRes,
+    };
+
+    return {
+        Request: requestData,
+        Response: responseData,
+    };
 }
 
-// Подключение к БД
-// const mongoURL = 'mongodb://rissenberg:password@127.0.0.1:27017/?authMechanism=DEFAULT';
-// const dbName = 'proxy_cache';
-//
-// const {MongoClient} = require('mongodb')
-//
-// const MongoDBclient = new MongoClient('mongodb://Timeweb:cloud@127.0.0.1:27017/?authMechanism=DEFAULT')
-//
-//
-// const connect = async () =>{
-//     try {
-//         await MongoDBclient.connect()
-//         console.log("Успешно подключились к базе данных")
-//         await MongoDBclient.close()
-//         console.log("Закрыли подключение")
-//     } catch (e) {
-//         console.log(e)
-//     }
-// }
-//
-// connect()
-//
-// const saveRequestResponse = (request, response) => {
-//     collection.insertOne({ request, response }, (err, result) => {
-//         if (err) {
-//             console.error('Ошибка сохранения в базу данных:', err);
-//         }
-//     });
-// };
 
 // Обработка обычных HTTP запросов
 const server = http.createServer((req, res) => {
     console.log(`Проксирование запроса ${req.method} ${req.url}`)
 
-    const {method, url, headers} = req;
-    const {host} = headers;
+    const { method, url, headers } = req;
+    const { host } = headers;
 
     const proxyPath = new URL(url).pathname
 
     delete headers['proxy-connection'];
 
-    const options = {
-        hostname: host,
-        port: 80,
-        path: proxyPath,
-        method,
-        headers
-    };
+    let body = [];
+    req.on('data', (chunk) => {
+        body.push(chunk);
+    }).on('end', () => {
+        body = Buffer.concat(body).toString();
 
-    const proxyReq = http.request(options, (proxyRes) => {
-        res.writeHead(proxyRes.statusCode, proxyRes.headers)
-            .on('error', (err) => console.log(err));
-        proxyRes.pipe(res, {end: true});
+        const options = {
+            hostname: host,
+            port: 80,
+            path: proxyPath,
+            method,
+            headers
+        };
+
+        const proxyReq = http.request(options, (proxyRes) => {
+            res.writeHead(proxyRes.statusCode, proxyRes.headers)
+                .on('error', (err) => console.log(err));
+            proxyRes.pipe(res, {end: true});
+
+            proxyRes.on('end', () => {
+                // console.log(reqResParser(req, proxyRes));
+                saveRequestResponse(reqResParser(req, proxyRes));
+            });
+
+        });
 
         proxyReq.on('error', (err) => console.log(err))
-    });
 
-    req.on('end', () => {
-        console.log(reqParser(req))
+        proxyReq.write(body);
+        proxyReq.end();
     });
-
-    proxyReq.end();
 });
 
 // HTTPS соединение
 server.on('connect', (req, clientSocket) => {
     console.log(`Проксирование HTTPS запроса ${req.method} ${req.url}`)
 
-    const {port, hostname} = Url.parse(`https://${req.url}`);
+    const { port, hostname } = url.parse(`https://${req.url}`);
     const serverSocket = net.connect(port, hostname);
 
-    serverSocket.on('connect', () => {
+    serverSocket.on('connect', (res) => {
         clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
 
         serverSocket.pipe(clientSocket);
@@ -157,4 +190,3 @@ server.listen(PORT, (err) => {
     }
     console.log('HTTP прокси сервер запущен на порту: ' + server.address().port);
 });
-
